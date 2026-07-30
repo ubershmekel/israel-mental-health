@@ -24,13 +24,17 @@ Three ways to run this:
      this wide):
          python fetch_trends.py --full-history
 
-Every request is a single keyword paired with its language's anchor term
-(2 terms max) - not a multi-keyword compare query - since that's the
-simplest, easiest-to-pace request shape. Each one is stored to SQLite
-immediately after it's fetched (not buffered to the end), and every run
-appends a timestamped log + a final report to logs/, so a crash or a
-rate-limit block never loses prior progress and always leaves a record of
-what happened.
+Every request queries exactly one keyword ALONE (self-normalized, no
+anchor term) - not a multi-keyword compare query. Earlier this paired each
+keyword with a "weather" anchor for future rescaling, but that rounds any
+niche mental-health phrase down to 0 every time (Trends normalizes to the
+larger term's peak, and weather dwarfs everything). Querying alone tells
+us honestly whether a term has any real search pattern at all; a properly
+scaled rescaling step is a separate follow-up once we know which keywords
+have real signal. Each request is stored to SQLite immediately after it's
+fetched (not buffered to the end), and every run appends a timestamped log
++ a final report to logs/, so a crash or a rate-limit block never loses
+prior progress and always leaves a record of what happened.
 
 Deliberately paced slow (one request every ~30s) - a full run is ~40
 requests (one per keyword), so there is no reason to hurry and real risk
@@ -204,12 +208,15 @@ def main():
         log.close()
         return
 
+    # "solo" tags requests as single-keyword/no-anchor (current shape), distinct
+    # from earlier anchor-paired runs whose stored 0s were an artifact of
+    # pairing with an oversized "weather" anchor, not real absence of data.
     if args.full_history:
         timeframe = f"{args.start} {args.end}"
-        mode = f"full:{args.geo}:{args.start}:{args.end}"
+        mode = f"solo-full:{args.geo}:{args.start}:{args.end}"
     else:
         timeframe = RECENT_TIMEFRAME
-        mode = f"recent:{args.geo}"
+        mode = f"solo-recent:{args.geo}"
 
     conn = db.connect()
     pytrends = make_pytrends()
@@ -226,10 +233,13 @@ def main():
     consecutive_failures = 0
     MAX_CONSECUTIVE_FAILURES = 3
     for i, batch in enumerate(batch_list, start=1):
-        terms = [batch["anchor"]["term"]] + [kw["term"] for kw in batch["keywords"]]
+        terms = [kw["term"] for kw in batch["keywords"]]
+        if batch["anchor"] is not None:
+            terms = [batch["anchor"]["term"]] + terms
         log.write(f"[{i}/{len(batch_list)}] ({batch['language']}) {terms}")
 
-        keyword_meta = {kw["term"]: kw for kw in batch["keywords"] + [batch["anchor"]]}
+        anchor_list = [batch["anchor"]] if batch["anchor"] is not None else []
+        keyword_meta = {kw["term"]: kw for kw in batch["keywords"] + anchor_list}
         keyword_ids = {}
         for term, kw in keyword_meta.items():
             is_anchor = kw is batch["anchor"]

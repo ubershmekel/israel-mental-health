@@ -2,9 +2,19 @@
 Keyword catalog for the Israel Mental Health Trends Index.
 
 Each entry maps one search term to an SDT indicator and a language.
-`ANCHORS` are stable, mental-health-unrelated terms included in every
-Google Trends request so batches can be rescaled onto a common axis later
-(Trends only normalizes values 0-100 within a single request of <=5 terms).
+
+`ANCHORS` were originally meant to be included in every Google Trends
+request so batches could be rescaled onto a common axis later (Trends only
+normalizes values 0-100 within a single request). In practice "weather" is
+FAR too large a topic for this: pairing a niche mental-health phrase with
+it just rounds the keyword down to 0 every time, regardless of its real
+volume, because Trends normalizes to the larger term's peak. So batches()
+currently queries each keyword ALONE (self-normalized) - that's enough to
+tell whether a term has any real search pattern in Israel at all. Proper
+cross-keyword rescaling (needed before terms can be compared/combined into
+an index) needs a right-sized anchor chosen after we know the rough
+magnitude of the real keywords, not a placeholder chosen up front - that's
+a follow-up problem, not solved yet.
 
 See README.md for the rationale behind each indicator and term.
 """
@@ -54,15 +64,17 @@ KEYWORDS = [
     {"term": "suicide hotline", "language": "en", "indicator": "crisis"},
     {"term": "panic attack help", "language": "en", "indicator": "crisis"},
     {"term": "therapist near me", "language": "en", "indicator": "crisis"},
+    {"term": "mental health help", "language": "en", "indicator": "crisis"},
     {"term": "התקף חרדה", "language": "he", "indicator": "crisis"},
     {"term": "תסמיני דיכאון", "language": "he", "indicator": "crisis"},
     {"term": "קו חם למניעת התאבדות", "language": "he", "indicator": "crisis"},
     {"term": "עזרה בהתקף פאניקה", "language": "he", "indicator": "crisis"},
     {"term": "ער\"ן", "language": "he", "indicator": "crisis"},
+    {"term": "עזרה נפשית", "language": "he", "indicator": "crisis"},
 ]
 
-# One anchor per language: stable, high-volume, mental-health-unrelated terms
-# used in every batch of that language to allow cross-batch rescaling.
+# NOTE: not currently used by batches() - see module docstring. Kept here
+# as candidates for a future, properly-scaled rescaling step.
 ANCHORS = [
     {"term": "weather", "language": "en", "indicator": "anchor"},
     {"term": "מזג אוויר", "language": "he", "indicator": "anchor"},
@@ -74,29 +86,15 @@ def all_keywords():
     return KEYWORDS + ANCHORS
 
 
-def batches(batch_size: int = 1):
+def batches():
     """
-    Group keywords into Google Trends request batches.
-
-    Each batch contains up to `batch_size` non-anchor keywords from the
-    same language, plus that language's anchor term (Trends caps requests
-    at 5 terms total, so batch_size should stay <= 4). Defaults to 1 -
-    one keyword + the anchor per request - so every network call is a
-    single, minimal, easy-to-pace query rather than a multi-keyword
-    compare request.
+    Yield one Google Trends request per keyword, queried alone (no anchor
+    term) so it's self-normalized - the only thing we're checking right
+    now is whether a term has any real search pattern in Israel at all.
     """
-    by_language = {}
     for kw in KEYWORDS:
-        by_language.setdefault(kw["language"], []).append(kw)
-
-    anchor_by_language = {a["language"]: a for a in ANCHORS}
-
-    for language, kws in by_language.items():
-        anchor = anchor_by_language[language]
-        for i in range(0, len(kws), batch_size):
-            chunk = kws[i:i + batch_size]
-            yield {
-                "language": language,
-                "anchor": anchor,
-                "keywords": chunk,
-            }
+        yield {
+            "language": kw["language"],
+            "anchor": None,
+            "keywords": [kw],
+        }
