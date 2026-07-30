@@ -16,7 +16,7 @@ This project grew out of the "גיבוש מדד לאומי לחוסן ולברי
 5. **התנסות ותיקוף** — Piloting & validation
 
 This repo is our attempt at steps 3–5: pick concrete, trackable indicators,
-build a tool that pulls the data on a schedule, and give people a way to
+build a tool that backfills their historical trend and gives people a way to
 explore it.
 
 ## Theoretical framework: Self-Determination Theory
@@ -45,7 +45,8 @@ to national mental health monitoring.
   or the official
   [Trends API (Alpha)](https://developers.google.com/search/blog/2025/07/trends-api)
   when available) — relative search interest (0–100) for keyword sets,
-  region = Israel (`geo=IL`), weekly resolution.
+  region = Israel (`geo=IL`), full available history (Trends data starts
+  **2004**, so a `timeframe=2004-01-01 2026-07-30` pull gets ~20 years).
 - Optionally cross-reference with **Google Trends' own Hebrew/English
   autocomplete & related-queries** to expand/validate the keyword lists over
   time.
@@ -55,13 +56,29 @@ to national mental health monitoring.
 
 ### Why Google Trends
 
-- Free, no auth wall for basic pulls, updated continuously, granular by
-  region/time, and Hebrew-language support out of the box.
-- Weaknesses to keep in mind: relative (not absolute) volume, indices are
-  re-normalized per query batch (need an "anchor term" to stitch batches
-  together consistently), small daily samples get noisy, and results are
-  sensitive to exact phrasing/spelling (Hebrew has multiple valid spellings
-  for the same term — need to test variants).
+- Free, no auth wall for basic pulls, deep historical coverage back to 2004,
+  granular by region/time, and Hebrew-language support out of the box.
+- Weaknesses to keep in mind:
+  - **Relative, not absolute** volume — each request is independently
+    normalized 0–100.
+  - **Resolution drops as the time window grows.** Google Trends returns
+    daily granularity only for windows under ~90 days; a multi-year request
+    like ours is auto-aggregated to **weekly** points for ranges up to ~5
+    years, and to **monthly** points beyond that. A 20-year pull means
+    **monthly resolution** (~240 points per keyword), not weekly.
+  - **Re-normalization across batches**: since values are only comparable
+    within one request, and one request covers max 5 terms, we need a
+    stable **anchor term** included in every batch (or Trends' own
+    overlapping-window rescaling approach) to stitch all keywords onto one
+    common scale across the full 20-year span.
+  - Small volumes get noisy (rare Hebrew phrasings may show as 0 for long
+    stretches then spike), and results are sensitive to exact
+    phrasing/spelling (Hebrew has multiple valid spellings for the same
+    term — need to test variants).
+  - Rate limiting: pytrends hits Google's public endpoint, which throttles
+    aggressively — a full backfill across many keyword batches needs
+    retries/backoff and will take a while to run, but since this is a
+    one-time historical pull (not a recurring job) that's a one-off cost.
 
 ## Seed keyword lists (draft — to be refined in step 3 above)
 
@@ -122,13 +139,18 @@ returns relative values within a single request of ≤5 terms.
                  │  Google Trends     │
                  │  (pytrends)        │
                  └─────────┬─────────┘
-                           │ weekly fetch, per keyword batch
+                           │ one-time backfill, 2004→today,
+                           │ per keyword batch (≤5 terms + anchor)
                            ▼
                  ┌───────────────────┐
-                 │  Ingest script     │  scripts/fetch_trends.py
+                 │  Backfill script   │  scripts/fetch_trends.py
                  │  - batches keywords│
+                 │  - full-history    │
+                 │    timeframe pull  │
                  │  - rescales w/     │
                  │    anchor term     │
+                 │  - retry/backoff   │
+                 │    for rate limits │
                  └─────────┬─────────┘
                            ▼
                  ┌───────────────────┐
@@ -148,23 +170,30 @@ returns relative values within a single request of ≤5 terms.
                            ▼
                  ┌───────────────────┐
                  │  Dashboard         │  app/dashboard.py (Streamlit)
-                 │  - time series     │
+                 │  - 20yr time series│
                  │  - per-indicator   │
                  │  - keyword drill-  │
                  │    down            │
+                 │  - event overlays  │
+                 │    (wars, COVID…)  │
                  └───────────────────┘
 ```
+
+The backfill script is designed to be **re-run occasionally** (not on a
+fixed schedule) to append recent months once new Trends data becomes
+available — it should be idempotent (upsert by keyword + month) so re-runs
+just extend/refresh the tail of the series rather than re-pulling everything.
 
 ### Database schema (draft)
 
 - `keywords(id, term, language, indicator, is_anchor, active)`
-- `raw_observations(id, keyword_id, week_start, value, batch_id, fetched_at)`
-- `indicator_scores(id, indicator, week_start, score)` — computed table
-- `composite_index(week_start, score)` — computed table
+- `raw_observations(id, keyword_id, month_start, value, batch_id, fetched_at)`
+- `indicator_scores(id, indicator, month_start, score)` — computed table
+- `composite_index(month_start, score)` — computed table
 
-SQLite is enough for this scale (a few hundred keywords × weekly points).
-Can move to Parquet/DuckDB later if we add finer time resolution or more
-regions.
+SQLite is enough for this scale (a few dozen keywords × ~240 monthly points
+each = low thousands of rows). Can move to Parquet/DuckDB later if we add
+finer time resolution or more regions.
 
 ## Roadmap
 
@@ -177,15 +206,18 @@ regions.
 - [ ] **Step 3 — Indicators**: finalize keyword lists above with a subject-
       matter reviewer; test Hebrew spelling variants; pick anchor term(s).
 - [ ] **Step 4 — Tool**:
-  - [ ] `scripts/fetch_trends.py` — pytrends ingestion with anchor-based
-        rescaling, writes to SQLite
+  - [ ] `scripts/fetch_trends.py` — pytrends historical backfill
+        (`timeframe='2004-01-01 <today>'`), anchor-based rescaling, retry/
+        backoff for rate limits, idempotent upsert into SQLite
   - [ ] `scripts/build_index.py` — per-indicator + composite scoring
-  - [ ] `app/dashboard.py` — Streamlit exploration UI (time series, filter
-        by indicator/keyword/language, compare to known events)
-  - [ ] Scheduled run (cron / GitHub Actions) for weekly refresh
-- [ ] **Step 5 — Pilot & validate**: run for a few months, sanity-check
-      spikes against known events (wars, holidays, terror attacks, COVID
-      waves), compare trend direction against any available survey data.
+  - [ ] `app/dashboard.py` — Streamlit exploration UI (20-year time series,
+        filter by indicator/keyword/language, compare to known events)
+  - [ ] Manual/occasional re-run (not scheduled) to extend the series as
+        new months of Trends data become available
+- [ ] **Step 5 — Pilot & validate**: sanity-check spikes against known
+      historical events (wars, holidays, terror attacks, COVID waves),
+      compare trend direction against any available survey data across the
+      full 20-year window.
 
 ## Getting started (once code exists)
 
