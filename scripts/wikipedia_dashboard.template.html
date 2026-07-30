@@ -1,0 +1,285 @@
+<section id="wikipedia-pageviews-vis" aria-labelledby="wpv-chart-heading">
+  <div class="wpv-heading viz-row">
+    <div>
+      <h2 id="wpv-chart-heading">Monthly page views</h2>
+      <div id="wpv-period" class="text-muted text-small"></div>
+    </div>
+    <div id="wpv-legend" class="wpv-legend" aria-label="Article legend"></div>
+  </div>
+
+  <div class="wpv-chart-wrap">
+    <svg id="wpv-chart" class="wpv-chart" viewBox="0 0 920 420" role="img"
+         aria-labelledby="wpv-svg-title wpv-svg-desc">
+      <title id="wpv-svg-title">Hebrew Wikipedia mental-health article views by month</title>
+      <desc id="wpv-svg-desc">Three lines compare monthly user page views. Breaks indicate missing data.</desc>
+    </svg>
+    <div id="wpv-tooltip" class="tooltip wpv-tooltip" aria-hidden="true"></div>
+  </div>
+
+  <div id="wpv-detail" class="wpv-detail text-small" aria-live="polite">
+    Move across the chart to inspect a month.
+  </div>
+
+  <div class="table-responsive">
+    <table class="table table-sm">
+      <thead>
+        <tr>
+          <th>Article</th>
+          <th class="text-end">Observed months</th>
+          <th class="text-end">Average / month</th>
+          <th>Peak month</th>
+          <th class="text-end">Peak views</th>
+        </tr>
+      </thead>
+      <tbody id="wpv-summary"></tbody>
+    </table>
+  </div>
+
+  <div class="wpv-note text-small text-muted">
+    Worldwide Hebrew Wikipedia user traffic · spiders and automated traffic excluded ·
+    incomplete months and unavailable historical windows shown as gaps
+  </div>
+</section>
+
+<style>
+  #wikipedia-pageviews-vis {
+    width: 100%;
+    color: var(--foreground);
+  }
+  #wikipedia-pageviews-vis .wpv-heading {
+    justify-content: space-between;
+    align-items: flex-start;
+    margin-bottom: 0.75rem;
+  }
+  #wikipedia-pageviews-vis .wpv-heading h2 {
+    margin: 0 0 0.15rem;
+  }
+  #wikipedia-pageviews-vis .wpv-legend {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    gap: 0.45rem 0.9rem;
+  }
+  #wikipedia-pageviews-vis .wpv-legend-item {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.35rem;
+    white-space: nowrap;
+  }
+  #wikipedia-pageviews-vis .wpv-swatch {
+    width: 1.15rem;
+    height: 0.18rem;
+    border-radius: 999px;
+    background: var(--series-color);
+  }
+  #wikipedia-pageviews-vis .wpv-chart-wrap {
+    position: relative;
+    width: 100%;
+  }
+  #wikipedia-pageviews-vis .wpv-chart {
+    display: block;
+    width: 100%;
+    height: auto;
+    min-height: 250px;
+    color: var(--muted-foreground);
+  }
+  #wikipedia-pageviews-vis .wpv-grid {
+    stroke: var(--border);
+    stroke-width: 1;
+  }
+  #wikipedia-pageviews-vis .wpv-axis-label {
+    fill: var(--muted-foreground);
+    font-size: 12px;
+  }
+  #wikipedia-pageviews-vis .wpv-series {
+    fill: none;
+    stroke: var(--series-color);
+    stroke-width: 2.5;
+    stroke-linejoin: round;
+    stroke-linecap: round;
+    vector-effect: non-scaling-stroke;
+  }
+  #wikipedia-pageviews-vis .wpv-crosshair {
+    stroke: var(--muted-foreground);
+    stroke-width: 1;
+    vector-effect: non-scaling-stroke;
+  }
+  #wikipedia-pageviews-vis .wpv-marker {
+    fill: var(--background);
+    stroke: var(--series-color);
+    stroke-width: 2.5;
+    vector-effect: non-scaling-stroke;
+  }
+  #wikipedia-pageviews-vis .wpv-tooltip {
+    position: absolute;
+    pointer-events: none;
+    visibility: hidden;
+    z-index: 2;
+  }
+  #wikipedia-pageviews-vis .wpv-tooltip.is-visible {
+    visibility: visible;
+  }
+  #wikipedia-pageviews-vis .wpv-detail {
+    min-height: 1.7rem;
+    margin: 0.35rem 0 0.75rem;
+    color: var(--foreground);
+  }
+  #wikipedia-pageviews-vis .wpv-note {
+    margin-top: 0.7rem;
+  }
+  @media (max-width: 560px) {
+    #wikipedia-pageviews-vis .wpv-legend {
+      justify-content: flex-start;
+    }
+    #wikipedia-pageviews-vis .wpv-chart {
+      min-height: 210px;
+    }
+  }
+</style>
+
+<script>
+(() => {
+  const root = document.getElementById("wikipedia-pageviews-vis");
+  const data = __WIKIPEDIA_PAGEVIEWS_DATA__;
+  const svg = root.querySelector("#wpv-chart");
+  const legend = root.querySelector("#wpv-legend");
+  const summary = root.querySelector("#wpv-summary");
+  const detail = root.querySelector("#wpv-detail");
+  const tooltip = root.querySelector("#wpv-tooltip");
+  const period = root.querySelector("#wpv-period");
+  const NS = "http://www.w3.org/2000/svg";
+  const W = 920, H = 420;
+  const margin = {top: 18, right: 24, bottom: 48, left: 72};
+  const plotW = W - margin.left - margin.right;
+  const plotH = H - margin.top - margin.bottom;
+  const format = new Intl.NumberFormat("en-US");
+  const monthFormat = new Intl.DateTimeFormat("en-US", {month: "short", year: "numeric", timeZone: "UTC"});
+  const months = data.series[0].values.map(row => row[0]);
+  const color = index => `var(--viz-series-${index})`;
+
+  const node = (name, attrs = {}) => {
+    const element = document.createElementNS(NS, name);
+    Object.entries(attrs).forEach(([key, value]) => element.setAttribute(key, value));
+    return element;
+  };
+  const monthLabel = value => monthFormat.format(new Date(`${value}-01T00:00:00Z`));
+  const allValues = data.series.flatMap(series => series.values.map(row => row[1]).filter(value => value !== null));
+  const rawMax = Math.max(...allValues);
+  const power = 10 ** Math.floor(Math.log10(rawMax));
+  const yMax = Math.ceil(rawMax / power) * power;
+  const x = index => margin.left + (index / Math.max(months.length - 1, 1)) * plotW;
+  const y = value => margin.top + plotH - (value / yMax) * plotH;
+
+  period.textContent = `${monthLabel(data.firstMonth)} – ${monthLabel(data.lastMonth)} · generated ${new Date(data.generated).toLocaleDateString()}`;
+
+  data.series.forEach(series => {
+    const item = document.createElement("span");
+    item.className = "wpv-legend-item text-small";
+    item.innerHTML = `<span class="wpv-swatch" style="--series-color:${color(series.color)}"></span><span dir="rtl">${series.article}</span>`;
+    legend.appendChild(item);
+  });
+
+  for (let tick = 0; tick <= 4; tick++) {
+    const value = (yMax / 4) * tick;
+    const py = y(value);
+    svg.appendChild(node("line", {x1: margin.left, y1: py, x2: W - margin.right, y2: py, class: "wpv-grid"}));
+    const label = node("text", {x: margin.left - 10, y: py + 4, "text-anchor": "end", class: "wpv-axis-label"});
+    label.textContent = format.format(value);
+    svg.appendChild(label);
+  }
+
+  const xTickCount = 5;
+  for (let tick = 0; tick <= xTickCount; tick++) {
+    const index = Math.round((months.length - 1) * tick / xTickCount);
+    const label = node("text", {x: x(index), y: H - 17, "text-anchor": tick === 0 ? "start" : tick === xTickCount ? "end" : "middle", class: "wpv-axis-label"});
+    label.textContent = monthLabel(months[index]);
+    svg.appendChild(label);
+  }
+
+  data.series.forEach(series => {
+    let segment = [];
+    const drawSegment = points => {
+      if (!points.length) return;
+      const path = node("path", {
+        d: points.map((point, i) => `${i ? "L" : "M"}${x(point.index).toFixed(2)},${y(point.value).toFixed(2)}`).join(" "),
+        class: "wpv-series",
+        style: `--series-color:${color(series.color)}`
+      });
+      svg.appendChild(path);
+    };
+    series.values.forEach((row, index) => {
+      if (row[1] === null) {
+        drawSegment(segment);
+        segment = [];
+      } else {
+        segment.push({index, value: row[1]});
+      }
+    });
+    drawSegment(segment);
+  });
+
+  data.series.forEach(series => {
+    const observed = series.values.filter(row => row[1] !== null);
+    const total = observed.reduce((sum, row) => sum + row[1], 0);
+    const peak = observed.reduce((best, row) => !best || row[1] > best[1] ? row : best, null);
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td><span dir="rtl">${series.article}</span><br><span class="text-muted text-small">${series.label}</span></td>
+      <td class="text-end">${format.format(observed.length)}</td>
+      <td class="text-end">${format.format(Math.round(total / observed.length))}</td>
+      <td>${monthLabel(peak[0])}</td>
+      <td class="text-end">${format.format(peak[1])}</td>`;
+    summary.appendChild(tr);
+  });
+
+  const crosshair = node("line", {y1: margin.top, y2: margin.top + plotH, class: "wpv-crosshair", visibility: "hidden"});
+  svg.appendChild(crosshair);
+  const markers = data.series.map(series => {
+    const marker = node("circle", {r: 4.5, class: "wpv-marker", visibility: "hidden", style: `--series-color:${color(series.color)}`});
+    svg.appendChild(marker);
+    return marker;
+  });
+  const overlay = node("rect", {x: margin.left, y: margin.top, width: plotW, height: plotH, fill: "transparent"});
+  svg.appendChild(overlay);
+
+  const inspect = event => {
+    const rect = svg.getBoundingClientRect();
+    const localX = ((event.clientX - rect.left) / rect.width) * W;
+    const index = Math.max(0, Math.min(months.length - 1, Math.round(((localX - margin.left) / plotW) * (months.length - 1))));
+    const px = x(index);
+    crosshair.setAttribute("x1", px);
+    crosshair.setAttribute("x2", px);
+    crosshair.setAttribute("visibility", "visible");
+    const rows = [];
+    data.series.forEach((series, seriesIndex) => {
+      const value = series.values[index][1];
+      const days = series.values[index][2];
+      const marker = markers[seriesIndex];
+      if (value === null) {
+        marker.setAttribute("visibility", "hidden");
+        rows.push(`<span dir="rtl">${series.article}</span>: missing`);
+      } else {
+        marker.setAttribute("cx", px);
+        marker.setAttribute("cy", y(value));
+        marker.setAttribute("visibility", "visible");
+        rows.push(`<span dir="rtl">${series.article}</span>: ${format.format(value)} (${days} days)`);
+      }
+    });
+    detail.innerHTML = `<strong>${monthLabel(months[index])}</strong> · ${rows.join(" · ")}`;
+    tooltip.innerHTML = `<strong>${monthLabel(months[index])}</strong><br>${rows.join("<br>")}`;
+    const chartRect = root.querySelector(".wpv-chart-wrap").getBoundingClientRect();
+    const desiredLeft = ((px / W) * rect.width);
+    tooltip.style.left = `${Math.max(6, Math.min(desiredLeft, chartRect.width - 220))}px`;
+    tooltip.style.top = "12px";
+    tooltip.classList.add("is-visible");
+    tooltip.setAttribute("aria-hidden", "false");
+  };
+  overlay.addEventListener("pointermove", inspect);
+  overlay.addEventListener("pointerleave", () => {
+    crosshair.setAttribute("visibility", "hidden");
+    markers.forEach(marker => marker.setAttribute("visibility", "hidden"));
+    tooltip.classList.remove("is-visible");
+    tooltip.setAttribute("aria-hidden", "true");
+  });
+})();
+</script>
