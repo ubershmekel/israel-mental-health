@@ -24,14 +24,17 @@ Three ways to run this:
      this wide):
          python fetch_trends.py --full-history
 
-Every batch is stored to SQLite immediately after it's fetched (not
-buffered to the end), and every run appends a timestamped log + a final
-report to logs/, so a crash or a rate-limit block never loses prior
-progress and always leaves a record of what happened.
+Every request is a single keyword paired with its language's anchor term
+(2 terms max) - not a multi-keyword compare query - since that's the
+simplest, easiest-to-pace request shape. Each one is stored to SQLite
+immediately after it's fetched (not buffered to the end), and every run
+appends a timestamped log + a final report to logs/, so a crash or a
+rate-limit block never loses prior progress and always leaves a record of
+what happened.
 
-Deliberately paced slow (one request every ~25s, well under Google's
-block threshold) - this is a small one-off job (~10 batches for a full
-run), so there is no reason to hurry and real risk in going fast.
+Deliberately paced slow (one request every ~30s) - a full run is ~40
+requests (one per keyword), so there is no reason to hurry and real risk
+in going fast.
 """
 
 import argparse
@@ -51,7 +54,7 @@ FULL_HISTORY_START = "2004-01-01"
 RECENT_TIMEFRAME = "today 12-m"
 MAX_RETRIES = 5
 BASE_BACKOFF_SECONDS = 45
-PAUSE_BETWEEN_BATCHES_SECONDS = 25
+PAUSE_BETWEEN_BATCHES_SECONDS = 30
 
 LOGS_DIR = Path(__file__).resolve().parent.parent / "logs"
 
@@ -104,7 +107,7 @@ def fetch_batch(pytrends: TrendReq, terms: list[str], timeframe: str, geo: str, 
             time.sleep(wait)
 
 
-def store_observations(conn, df, keyword_ids: dict, batch_id: str):
+def store_observations(conn, df, keyword_ids: dict, batch_id: str, mode: str):
     """Write rows immediately (called right after each fetch, not buffered)."""
     if df is None or df.empty:
         return {}, 0
@@ -119,17 +122,18 @@ def store_observations(conn, df, keyword_ids: dict, batch_id: str):
         for term, value in row.items():
             value = int(value)
             keyword_id = keyword_ids[term]
-            rows.append((keyword_id, period_str, value, batch_id, fetched_at))
+            rows.append((keyword_id, period_str, value, batch_id, fetched_at, mode))
             max_value_by_term[term] = max(max_value_by_term[term], value)
 
     conn.executemany(
         """
         INSERT INTO raw_observations
-            (keyword_id, period_start, value, batch_id, fetched_at)
-        VALUES (?, ?, ?, ?, ?)
+            (keyword_id, period_start, value, batch_id, fetched_at, mode)
+        VALUES (?, ?, ?, ?, ?, ?)
         ON CONFLICT (keyword_id, period_start, batch_id) DO UPDATE SET
             value = excluded.value,
-            fetched_at = excluded.fetched_at
+            fetched_at = excluded.fetched_at,
+            mode = excluded.mode
         """,
         rows,
     )
@@ -137,23 +141,35 @@ def store_observations(conn, df, keyword_ids: dict, batch_id: str):
     return max_value_by_term, len(rows)
 
 
-def run_test(geo: str, log: Logger):
-    """Exactly one request, minimal footprint - use this on a new machine."""
-    log.write(f"TEST MODE: single request, geo={geo}, timeframe={RECENT_TIMEFRAME}")
+# Harmless, high-volume, unrelated filler terms - used only for diagnosing
+# whether failures are about term COUNT rather than the real keywords.
+DIAGNOSTIC_TERMS = ["weather", "coffee", "football", "music", "movies"]
+
+
+def run_test(geo: str, log: Logger, n_terms: int):
+    """
+    Exactly one request, minimal footprint - use this on a new machine, or
+    to isolate whether a failure is caused by multi-term ("compare")
+    requests specifically. --test defaults to 1 term; pass --terms N to
+    test with N terms instead (uses harmless filler terms, not the real
+    keyword list).
+    """
+    terms = DIAGNOSTIC_TERMS[:n_terms]
+    log.write(f"TEST MODE: single request, {n_terms} term(s) {terms}, "
+              f"geo={geo}, timeframe={RECENT_TIMEFRAME}")
     pytrends = make_pytrends()
-    term = "weather"
     try:
-        df = fetch_batch(pytrends, [term], RECENT_TIMEFRAME, geo, log)
+        df = fetch_batch(pytrends, terms, RECENT_TIMEFRAME, geo, log)
     except Exception as exc:
         log.write(f"TEST FAILED: {exc}")
         sys.exit(1)
 
     if df is None or df.empty:
-        log.write("TEST RESULT: request succeeded but returned no data (unexpected for 'weather').")
+        log.write("TEST RESULT: request succeeded but returned no data (unexpected for these terms).")
     else:
-        log.write(f"TEST RESULT: success. Got {len(df)} rows for '{term}'.")
+        log.write(f"TEST RESULT: success. Got {len(df)} rows for {terms}.")
         log.write(df.to_string())
-    log.write("Connectivity test passed - safe to run a full batch job.")
+    log.write(f"Connectivity test with {n_terms} term(s) passed.")
 
 
 def main():
@@ -162,6 +178,10 @@ def main():
     )
     parser.add_argument("--test", action="store_true",
                          help="Run exactly one request to verify connectivity, then exit.")
+    parser.add_argument("--terms", type=int, default=1, choices=range(1, 6),
+                         help="Number of terms to use with --test (default 1). "
+                              "Use this to isolate whether failures are caused by "
+                              "multi-term 'compare' requests specifically.")
     parser.add_argument("--full-history", action="store_true",
                          help=f"Pull the full {FULL_HISTORY_START}-to-today range instead of "
                               "just the most recent 12 months.")
@@ -171,25 +191,40 @@ def main():
                          help="Backfill end date (YYYY-MM-DD), only used with --full-history")
     parser.add_argument("--geo", default=DEFAULT_GEO,
                          help="Google Trends geo code (default: IL)")
+    parser.add_argument("--force", action="store_true",
+                         help="Re-fetch keywords even if already stored for this mode "
+                              "(default: skip keywords that already have data).")
     args = parser.parse_args()
 
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
     log = Logger(run_id)
 
     if args.test:
-        run_test(args.geo, log)
+        run_test(args.geo, log, args.terms)
         log.close()
         return
 
-    timeframe = f"{args.start} {args.end}" if args.full_history else RECENT_TIMEFRAME
+    if args.full_history:
+        timeframe = f"{args.start} {args.end}"
+        mode = f"full:{args.geo}:{args.start}:{args.end}"
+    else:
+        timeframe = RECENT_TIMEFRAME
+        mode = f"recent:{args.geo}"
+
     conn = db.connect()
     pytrends = make_pytrends()
 
     batch_list = list(batches())
-    log.write(f"Fetching {len(batch_list)} batches for timeframe '{timeframe}', geo={args.geo}")
+    log.write(f"Fetching up to {len(batch_list)} single-keyword requests for timeframe "
+              f"'{timeframe}', geo={args.geo}, mode='{mode}', "
+              f"paced {PAUSE_BETWEEN_BATCHES_SECONDS}s apart"
+              + (" (--force: re-fetching even if already stored)" if args.force else
+                 " (already-fetched keywords for this mode will be skipped)"))
 
     report_rows = []  # (term, language, indicator, max_value, has_data)
     total_rows = 0
+    consecutive_failures = 0
+    MAX_CONSECUTIVE_FAILURES = 3
     for i, batch in enumerate(batch_list, start=1):
         terms = [batch["anchor"]["term"]] + [kw["term"] for kw in batch["keywords"]]
         log.write(f"[{i}/{len(batch_list)}] ({batch['language']}) {terms}")
@@ -203,17 +238,38 @@ def main():
             )
         conn.commit()
 
+        # Resume support: skip keywords already fetched for this mode unless --force.
+        primary_kw = batch["keywords"][0]
+        primary_id = keyword_ids[primary_kw["term"]]
+        existing = db.existing_max_value(conn, primary_id, mode)
+        if existing is not None and not args.force:
+            log.write(f"  already have data for '{primary_kw['term']}' (mode={mode}, "
+                      f"max_value={existing}) - skipping, no request sent")
+            has_data = "YES" if existing > 0 else "no data in geo"
+            report_rows.append((primary_kw["term"], primary_kw["language"],
+                                 primary_kw["indicator"], existing, f"{has_data} (cached)"))
+            continue
+
         try:
             df = fetch_batch(pytrends, terms, timeframe, args.geo, log)
         except Exception as exc:
-            log.write(f"  batch {i} FAILED after all retries: {exc}. "
+            log.write(f"  request {i} FAILED after all retries: {exc}. "
                       f"Progress so far is already saved to {db.DB_PATH}.")
             for term in terms:
                 kw = keyword_meta[term]
                 report_rows.append((term, kw["language"], kw["indicator"], None, "ERROR"))
-            break  # stop the whole run rather than keep hammering Google
+            consecutive_failures += 1
+            if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                log.write(f"  {consecutive_failures} consecutive failures - stopping the "
+                          f"run rather than keep hammering Google. Re-run later to resume "
+                          f"(already-fetched keywords won't be re-fetched needlessly).")
+                break
+            if i < len(batch_list):
+                time.sleep(PAUSE_BETWEEN_BATCHES_SECONDS)
+            continue
 
-        max_value_by_term, n = store_observations(conn, df, keyword_ids, uuid.uuid4().hex)
+        consecutive_failures = 0
+        max_value_by_term, n = store_observations(conn, df, keyword_ids, uuid.uuid4().hex, mode)
         total_rows += n
         log.write(f"  stored {n} observations")
 

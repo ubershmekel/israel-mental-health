@@ -5,7 +5,7 @@ from pathlib import Path
 
 DB_PATH = Path(__file__).resolve().parent.parent / "data" / "trends.db"
 
-SCHEMA = """
+TABLES_SCHEMA = """
 CREATE TABLE IF NOT EXISTS keywords (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     term TEXT NOT NULL,
@@ -25,9 +25,14 @@ CREATE TABLE IF NOT EXISTS raw_observations (
     fetched_at TEXT NOT NULL,
     UNIQUE (keyword_id, period_start, batch_id)
 );
+"""
 
+INDEXES_SCHEMA = """
 CREATE INDEX IF NOT EXISTS idx_raw_observations_keyword
     ON raw_observations (keyword_id);
+
+CREATE INDEX IF NOT EXISTS idx_raw_observations_keyword_mode
+    ON raw_observations (keyword_id, mode);
 """
 
 
@@ -35,7 +40,16 @@ def connect() -> sqlite3.Connection:
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
     conn.execute("PRAGMA foreign_keys = ON")
-    conn.executescript(SCHEMA)
+    conn.executescript(TABLES_SCHEMA)
+
+    # Migration: older DBs may predate the `mode` column. Must run before
+    # creating indexes that reference it.
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(raw_observations)")}
+    if "mode" not in cols:
+        conn.execute("ALTER TABLE raw_observations ADD COLUMN mode TEXT NOT NULL DEFAULT ''")
+        conn.commit()
+
+    conn.executescript(INDEXES_SCHEMA)
     return conn
 
 
@@ -56,3 +70,12 @@ def upsert_keyword(conn: sqlite3.Connection, term: str, language: str,
         (term, language),
     ).fetchone()
     return row[0]
+
+
+def existing_max_value(conn: sqlite3.Connection, keyword_id: int, mode: str):
+    """Highest stored value for this keyword+mode, or None if never fetched."""
+    row = conn.execute(
+        "SELECT MAX(value) FROM raw_observations WHERE keyword_id = ? AND mode = ?",
+        (keyword_id, mode),
+    ).fetchone()
+    return row[0]  # None if no rows exist for this keyword+mode

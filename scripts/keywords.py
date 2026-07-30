@@ -74,13 +74,16 @@ def all_keywords():
     return KEYWORDS + ANCHORS
 
 
-def batches(batch_size: int = 4):
+def batches(batch_size: int = 1):
     """
     Group keywords into Google Trends request batches.
 
     Each batch contains up to `batch_size` non-anchor keywords from the
     same language, plus that language's anchor term (Trends caps requests
-    at 5 terms total, so batch_size should stay <= 4).
+    at 5 terms total, so batch_size should stay <= 4). Defaults to 1 -
+    one keyword + the anchor per request - so every network call is a
+    single, minimal, easy-to-pace query rather than a multi-keyword
+    compare request.
     """
     by_language = {}
     for kw in KEYWORDS:
