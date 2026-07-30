@@ -14,8 +14,8 @@ Three ways to run this:
      machine/network) - exactly ONE request, most recent 12 months only:
          python fetch_trends.py --test
 
-  2. Default run - most recent 12 months for every batch. Cheap, and lets
-     you see (via the report file) which keywords have any IL search
+  2. Default run - most recent 12 months for every keyword. Cheap, and
+     lets you see (via the report file) which keywords have any IL search
      volume at all before committing to a full historical pull:
          python fetch_trends.py
 
@@ -24,21 +24,33 @@ Three ways to run this:
      this wide):
          python fetch_trends.py --full-history
 
-Every request queries exactly one keyword ALONE (self-normalized, no
-anchor term) - not a multi-keyword compare query. Earlier this paired each
-keyword with a "weather" anchor for future rescaling, but that rounds any
-niche mental-health phrase down to 0 every time (Trends normalizes to the
-larger term's peak, and weather dwarfs everything). Querying alone tells
-us honestly whether a term has any real search pattern at all; a properly
-scaled rescaling step is a separate follow-up once we know which keywords
-have real signal. Each request is stored to SQLite immediately after it's
-fetched (not buffered to the end), and every run appends a timestamped log
-+ a final report to logs/, so a crash or a rate-limit block never loses
-prior progress and always leaves a record of what happened.
+Uses trendspyg (https://pypi.org/project/trendspyg/) instead of pytrends.
+pytrends calls Google's internal API directly and got blocked with an
+immediate 429 on almost every multi-keyword request in testing, even with
+a browser User-Agent and slow pacing. trendspyg instead drives a real
+headless Chrome browser to read the same chart a human would see, which
+looks like genuine browser traffic rather than a scraper and reliably
+avoided the block in testing. Trade-off: much slower per call (~10-30s,
+it's rendering a real page) - fine for a one-off backfill, not for
+anything latency-sensitive.
 
-Deliberately paced slow (one request every ~30s) - a full run is ~40
-requests (one per keyword), so there is no reason to hurry and real risk
-in going fast.
+Every request queries exactly one keyword ALONE (self-normalized, no
+anchor term). An earlier version paired each keyword with a "weather"
+anchor for future rescaling, but that rounds any niche mental-health
+phrase down to 0 every time (Trends normalizes to the larger term's peak,
+and weather dwarfs everything). Querying alone tells us honestly whether a
+term has any real search pattern at all; a properly scaled rescaling step
+is a separate follow-up once we know which keywords have real signal.
+
+Each request is stored to SQLite immediately after it's fetched (not
+buffered to the end), and every run appends a timestamped log + a final
+report to logs/, so a crash or a block never loses prior progress and
+always leaves a record of what happened. Re-running skips keywords
+already fetched for the current mode (see --force).
+
+Still deliberately paced (one request every ~15s on top of trendspyg's own
+~10-30s browser render time) - a full run is ~40 requests, so there is no
+reason to hurry.
 """
 
 import argparse
@@ -48,7 +60,7 @@ import uuid
 from datetime import date, datetime, timezone
 from pathlib import Path
 
-from pytrends.request import TrendReq
+import trendspyg
 
 import db
 from keywords import batches
@@ -56,19 +68,11 @@ from keywords import batches
 DEFAULT_GEO = "IL"
 FULL_HISTORY_START = "2004-01-01"
 RECENT_TIMEFRAME = "today 12-m"
-MAX_RETRIES = 5
-BASE_BACKOFF_SECONDS = 45
-PAUSE_BETWEEN_BATCHES_SECONDS = 30
+PAUSE_BETWEEN_REQUESTS_SECONDS = 15
+TRENDSPYG_MAX_RETRIES = 5
+TRENDSPYG_RETRY_WAIT = 10.0
 
 LOGS_DIR = Path(__file__).resolve().parent.parent / "logs"
-
-# Google blocks the default python-requests User-Agent outright (immediate
-# 429 on the very first request, unrelated to actual rate limiting). A
-# browser-like UA is required.
-USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-)
 
 
 class Logger:
@@ -89,45 +93,32 @@ class Logger:
         self._fh.close()
 
 
-def make_pytrends() -> TrendReq:
-    return TrendReq(
-        hl="en-US", tz=0,
-        requests_args={"headers": {"User-Agent": USER_AGENT}},
+def fetch_keyword(term: str, timeframe: str, geo: str, log: Logger):
+    """
+    Fetch interest_over_time for one keyword via trendspyg. trendspyg
+    already retries internally past Google's soft-throttle (up to
+    TRENDSPYG_MAX_RETRIES chart-load attempts), so no extra outer retry
+    loop is needed here.
+    """
+    return trendspyg.download_google_trends_interest_over_time(
+        term, geo=geo, timeframe=timeframe,
+        max_retries=TRENDSPYG_MAX_RETRIES, retry_wait=TRENDSPYG_RETRY_WAIT,
     )
 
 
-def fetch_batch(pytrends: TrendReq, terms: list[str], timeframe: str, geo: str, log: Logger):
-    """Fetch interest_over_time for one batch, retrying on rate limits."""
-    for attempt in range(1, MAX_RETRIES + 1):
-        try:
-            pytrends.build_payload(terms, timeframe=timeframe, geo=geo)
-            return pytrends.interest_over_time()
-        except Exception as exc:  # pytrends raises different errors across versions
-            wait = BASE_BACKOFF_SECONDS * attempt
-            log.write(f"  fetch failed (attempt {attempt}/{MAX_RETRIES}): {exc}. "
-                      f"Retrying in {wait}s...")
-            if attempt == MAX_RETRIES:
-                raise
-            time.sleep(wait)
-
-
-def store_observations(conn, df, keyword_ids: dict, batch_id: str, mode: str):
+def store_observations(conn, series, keyword_id: int, batch_id: str, mode: str):
     """Write rows immediately (called right after each fetch, not buffered)."""
-    if df is None or df.empty:
-        return {}, 0
+    if not series:
+        return 0, 0
 
-    df = df.drop(columns=["isPartial"], errors="ignore")
     fetched_at = datetime.now(timezone.utc).isoformat()
-
     rows = []
-    max_value_by_term = {term: 0 for term in df.columns}
-    for period_start, row in df.iterrows():
-        period_str = period_start.strftime("%Y-%m-%d")
-        for term, value in row.items():
-            value = int(value)
-            keyword_id = keyword_ids[term]
-            rows.append((keyword_id, period_str, value, batch_id, fetched_at, mode))
-            max_value_by_term[term] = max(max_value_by_term[term], value)
+    max_value = 0
+    for point in series:
+        period_str = point["date"][:10]  # ISO8601 -> YYYY-MM-DD
+        value = int(point["value"])
+        rows.append((keyword_id, period_str, value, batch_id, fetched_at, mode))
+        max_value = max(max_value, value)
 
     conn.executemany(
         """
@@ -142,38 +133,26 @@ def store_observations(conn, df, keyword_ids: dict, batch_id: str, mode: str):
         rows,
     )
     conn.commit()
-    return max_value_by_term, len(rows)
+    return max_value, len(rows)
 
 
-# Harmless, high-volume, unrelated filler terms - used only for diagnosing
-# whether failures are about term COUNT rather than the real keywords.
-DIAGNOSTIC_TERMS = ["weather", "coffee", "football", "music", "movies"]
-
-
-def run_test(geo: str, log: Logger, n_terms: int):
-    """
-    Exactly one request, minimal footprint - use this on a new machine, or
-    to isolate whether a failure is caused by multi-term ("compare")
-    requests specifically. --test defaults to 1 term; pass --terms N to
-    test with N terms instead (uses harmless filler terms, not the real
-    keyword list).
-    """
-    terms = DIAGNOSTIC_TERMS[:n_terms]
-    log.write(f"TEST MODE: single request, {n_terms} term(s) {terms}, "
-              f"geo={geo}, timeframe={RECENT_TIMEFRAME}")
-    pytrends = make_pytrends()
+def run_test(geo: str, log: Logger):
+    """Exactly one request, minimal footprint - use this on a new machine."""
+    log.write(f"TEST MODE: single request, term='weather', geo={geo}, "
+              f"timeframe={RECENT_TIMEFRAME}")
     try:
-        df = fetch_batch(pytrends, terms, RECENT_TIMEFRAME, geo, log)
+        series = fetch_keyword("weather", RECENT_TIMEFRAME, geo, log)
     except Exception as exc:
         log.write(f"TEST FAILED: {exc}")
         sys.exit(1)
 
-    if df is None or df.empty:
-        log.write("TEST RESULT: request succeeded but returned no data (unexpected for these terms).")
+    if not series:
+        log.write("TEST RESULT: request succeeded but returned no data (unexpected for 'weather').")
     else:
-        log.write(f"TEST RESULT: success. Got {len(df)} rows for {terms}.")
-        log.write(df.to_string())
-    log.write(f"Connectivity test with {n_terms} term(s) passed.")
+        log.write(f"TEST RESULT: success. Got {len(series)} points.")
+        log.write(f"  first: {series[0]}")
+        log.write(f"  last:  {series[-1]}")
+    log.write("Connectivity test passed - safe to run a full job.")
 
 
 def main():
@@ -182,10 +161,6 @@ def main():
     )
     parser.add_argument("--test", action="store_true",
                          help="Run exactly one request to verify connectivity, then exit.")
-    parser.add_argument("--terms", type=int, default=1, choices=range(1, 6),
-                         help="Number of terms to use with --test (default 1). "
-                              "Use this to isolate whether failures are caused by "
-                              "multi-term 'compare' requests specifically.")
     parser.add_argument("--full-history", action="store_true",
                          help=f"Pull the full {FULL_HISTORY_START}-to-today range instead of "
                               "just the most recent 12 months.")
@@ -204,13 +179,13 @@ def main():
     log = Logger(run_id)
 
     if args.test:
-        run_test(args.geo, log, args.terms)
+        run_test(args.geo, log)
         log.close()
         return
 
     # "solo" tags requests as single-keyword/no-anchor (current shape), distinct
-    # from earlier anchor-paired runs whose stored 0s were an artifact of
-    # pairing with an oversized "weather" anchor, not real absence of data.
+    # from earlier anchor-paired pytrends runs whose stored 0s were an artifact
+    # of pairing with an oversized "weather" anchor, not real absence of data.
     if args.full_history:
         timeframe = f"{args.start} {args.end}"
         mode = f"solo-full:{args.geo}:{args.start}:{args.end}"
@@ -219,55 +194,42 @@ def main():
         mode = f"solo-recent:{args.geo}"
 
     conn = db.connect()
-    pytrends = make_pytrends()
 
     batch_list = list(batches())
-    log.write(f"Fetching up to {len(batch_list)} single-keyword requests for timeframe "
-              f"'{timeframe}', geo={args.geo}, mode='{mode}', "
-              f"paced {PAUSE_BETWEEN_BATCHES_SECONDS}s apart"
+    log.write(f"Fetching up to {len(batch_list)} single-keyword requests (trendspyg) "
+              f"for timeframe '{timeframe}', geo={args.geo}, mode='{mode}', "
+              f"paced {PAUSE_BETWEEN_REQUESTS_SECONDS}s apart"
               + (" (--force: re-fetching even if already stored)" if args.force else
                  " (already-fetched keywords for this mode will be skipped)"))
 
-    report_rows = []  # (term, language, indicator, max_value, has_data)
+    report_rows = []  # (term, language, indicator, max_value, status)
     total_rows = 0
     consecutive_failures = 0
     MAX_CONSECUTIVE_FAILURES = 3
     for i, batch in enumerate(batch_list, start=1):
-        terms = [kw["term"] for kw in batch["keywords"]]
-        if batch["anchor"] is not None:
-            terms = [batch["anchor"]["term"]] + terms
-        log.write(f"[{i}/{len(batch_list)}] ({batch['language']}) {terms}")
+        kw = batch["keywords"][0]
+        term = kw["term"]
+        log.write(f"[{i}/{len(batch_list)}] ({batch['language']}) '{term}'")
 
-        anchor_list = [batch["anchor"]] if batch["anchor"] is not None else []
-        keyword_meta = {kw["term"]: kw for kw in batch["keywords"] + anchor_list}
-        keyword_ids = {}
-        for term, kw in keyword_meta.items():
-            is_anchor = kw is batch["anchor"]
-            keyword_ids[term] = db.upsert_keyword(
-                conn, kw["term"], kw["language"], kw["indicator"], is_anchor
-            )
+        keyword_id = db.upsert_keyword(conn, term, kw["language"], kw["indicator"], False)
         conn.commit()
 
         # Resume support: skip keywords already fetched for this mode unless --force.
-        primary_kw = batch["keywords"][0]
-        primary_id = keyword_ids[primary_kw["term"]]
-        existing = db.existing_max_value(conn, primary_id, mode)
+        existing = db.existing_max_value(conn, keyword_id, mode)
         if existing is not None and not args.force:
-            log.write(f"  already have data for '{primary_kw['term']}' (mode={mode}, "
+            log.write(f"  already have data for '{term}' (mode={mode}, "
                       f"max_value={existing}) - skipping, no request sent")
             has_data = "YES" if existing > 0 else "no data in geo"
-            report_rows.append((primary_kw["term"], primary_kw["language"],
-                                 primary_kw["indicator"], existing, f"{has_data} (cached)"))
+            report_rows.append((term, kw["language"], kw["indicator"], existing,
+                                 f"{has_data} (cached)"))
             continue
 
         try:
-            df = fetch_batch(pytrends, terms, timeframe, args.geo, log)
+            series = fetch_keyword(term, timeframe, args.geo, log)
         except Exception as exc:
-            log.write(f"  request {i} FAILED after all retries: {exc}. "
+            log.write(f"  request {i} FAILED: {exc}. "
                       f"Progress so far is already saved to {db.DB_PATH}.")
-            for term in terms:
-                kw = keyword_meta[term]
-                report_rows.append((term, kw["language"], kw["indicator"], None, "ERROR"))
+            report_rows.append((term, kw["language"], kw["indicator"], None, "ERROR"))
             consecutive_failures += 1
             if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
                 log.write(f"  {consecutive_failures} consecutive failures - stopping the "
@@ -275,24 +237,21 @@ def main():
                           f"(already-fetched keywords won't be re-fetched needlessly).")
                 break
             if i < len(batch_list):
-                time.sleep(PAUSE_BETWEEN_BATCHES_SECONDS)
+                time.sleep(PAUSE_BETWEEN_REQUESTS_SECONDS)
             continue
 
         consecutive_failures = 0
-        max_value_by_term, n = store_observations(conn, df, keyword_ids, uuid.uuid4().hex, mode)
+        max_value, n = store_observations(conn, series, keyword_id, uuid.uuid4().hex, mode)
         total_rows += n
         log.write(f"  stored {n} observations")
 
-        for term in terms:
-            kw = keyword_meta[term]
-            max_value = max_value_by_term.get(term, 0)
-            has_data = "YES" if max_value > 0 else "no data in geo"
-            report_rows.append((term, kw["language"], kw["indicator"], max_value, has_data))
-            if max_value == 0:
-                log.write(f"    '{term}': no search volume found for geo={args.geo}")
+        has_data = "YES" if max_value > 0 else "no data in geo"
+        report_rows.append((term, kw["language"], kw["indicator"], max_value, has_data))
+        if max_value == 0:
+            log.write(f"    '{term}': no search volume found for geo={args.geo}")
 
         if i < len(batch_list):
-            time.sleep(PAUSE_BETWEEN_BATCHES_SECONDS)
+            time.sleep(PAUSE_BETWEEN_REQUESTS_SECONDS)
 
     conn.close()
     log.write(f"Done. {total_rows} total observations written to {db.DB_PATH}")
@@ -301,9 +260,9 @@ def main():
     with open(report_path, "w", encoding="utf-8") as f:
         f.write(f"Fetch run {run_id}  timeframe={timeframe}  geo={args.geo}\n")
         f.write(f"{'term':40} {'lang':5} {'indicator':12} {'max_value':10} status\n")
-        for term, language, indicator, max_value, has_data in report_rows:
+        for term, language, indicator, max_value, status in report_rows:
             mv = "" if max_value is None else str(max_value)
-            f.write(f"{term:40} {language:5} {indicator:12} {mv:10} {has_data}\n")
+            f.write(f"{term:40} {language:5} {indicator:12} {mv:10} {status}\n")
     log.write(f"Report written to {report_path}")
     log.close()
 
