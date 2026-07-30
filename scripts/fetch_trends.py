@@ -65,6 +65,13 @@ import trendspyg
 import db
 from keywords import batches
 
+# Windows consoles often default to cp1252, which can't encode Hebrew
+# keyword terms - reconfigure stdout to UTF-8 so printing them never
+# crashes the run (this bit the first live run: it died mid-batch the
+# moment it reached a Hebrew keyword).
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
 DEFAULT_GEO = "IL"
 FULL_HISTORY_START = "2004-01-01"
 RECENT_TIMEFRAME = "today 12-m"
