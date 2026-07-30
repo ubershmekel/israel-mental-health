@@ -54,6 +54,14 @@ to national mental health monitoring.
   קיימים" step (e.g. Ministry of Health, Kann Social/117 hotline volumes,
   CBS surveys) for validation, not as the primary signal.
 
+### Wikipedia Pageviews
+
+Wikimedia's official Analytics API provides an independent, absolute-volume
+signal for selected Hebrew mental-health articles. Per-article history starts
+on 2015-07-01. This signal covers all readers of Hebrew Wikipedia worldwide;
+the API does not provide an Israel-only geographic filter for an individual
+article.
+
 ### Why Google Trends
 
 - Free, no auth wall for basic pulls, deep historical coverage back to 2004,
@@ -272,6 +280,29 @@ Results are written to `data/trends.db` immediately after each batch (not
 buffered to the end), and re-running is safe — rows are upserted, so a
 partial or interrupted run never duplicates data and can just be re-run to
 pick up where it left off.
+
+### Wikipedia Pageviews collector
+
+The independent Wikipedia collector uses only Python's standard library and
+writes absolute daily counts to `data/wikipedia_pageviews.db`, deliberately
+separate from Google Trends' normalized 0-100 observations.
+
+```bash
+cd scripts
+python fetch_wikipedia_pageviews.py --test
+python fetch_wikipedia_pageviews.py
+python fetch_wikipedia_pageviews.py --full-history
+```
+
+The default run refreshes the previous 365 complete days. The full-history
+run fetches 2015-07-01 through yesterday in API-friendly yearly chunks.
+For recurring or shared use, identify the project with a User-Agent containing
+a contact URL or email:
+
+```bash
+set WIKIMEDIA_USER_AGENT=IsraelMentalHealthIndex/0.1 (contact@example.org)
+python fetch_wikipedia_pageviews.py --full-history
+```
 
 ### Next steps (not built yet)
 
