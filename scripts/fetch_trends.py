@@ -93,6 +93,22 @@ class Logger:
         self._fh.close()
 
 
+def _is_no_data_error(exc: Exception) -> bool:
+    """
+    trendspyg's chart-ready check only looks for a rendered <svg> in the
+    TIMESERIES widget. A genuinely zero-volume keyword shows Google's "not
+    enough search volume" widget state instead - no chart, no throttle
+    message either - which trendspyg can't distinguish from a real UI
+    change, so it raises BrowserError with this specific message. Treat
+    that one message as "no data" rather than a real failure; any other
+    BrowserError (e.g. Chrome failed to start) still counts as a failure.
+    """
+    return (
+        isinstance(exc, trendspyg.BrowserError)
+        and "did not render the interest-over-time chart" in str(exc)
+    )
+
+
 def fetch_keyword(term: str, timeframe: str, geo: str, log: Logger):
     """
     Fetch interest_over_time for one keyword via trendspyg. trendspyg
@@ -227,6 +243,20 @@ def main():
         try:
             series = fetch_keyword(term, timeframe, args.geo, log)
         except Exception as exc:
+            if _is_no_data_error(exc):
+                log.write(f"  '{term}': chart never rendered and no throttle message "
+                          f"was shown - treating as zero search volume, not a failure")
+                # An empty series wouldn't leave a row for the resume/skip check to
+                # find next time, so store one explicit zero point for this mode.
+                zero_point = [{"date": date.today().isoformat(), "value": 0, "is_partial": True}]
+                store_observations(conn, zero_point, keyword_id, uuid.uuid4().hex, mode)
+                report_rows.append((term, kw["language"], kw["indicator"], 0,
+                                     "no data in geo (chart never rendered)"))
+                consecutive_failures = 0
+                if i < len(batch_list):
+                    time.sleep(PAUSE_BETWEEN_REQUESTS_SECONDS)
+                continue
+
             log.write(f"  request {i} FAILED: {exc}. "
                       f"Progress so far is already saved to {db.DB_PATH}.")
             report_rows.append((term, kw["language"], kw["indicator"], None, "ERROR"))
