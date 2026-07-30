@@ -219,11 +219,63 @@ finer time resolution or more regions.
       compare trend direction against any available survey data across the
       full 20-year window.
 
-## Getting started (once code exists)
+## Getting started
 
 ```bash
+python -m venv .venv
+.venv/Scripts/activate      # or: source .venv/bin/activate  (macOS/Linux)
 pip install -r requirements.txt
-python scripts/fetch_trends.py      # populate data/trends.db
+```
+
+### Running the fetcher on any machine (do these in order)
+
+Google blocks scraper-like traffic aggressively, so **always start with a
+connectivity test** before running a real batch job — especially the first
+time on a new machine or network:
+
+```bash
+cd scripts
+python fetch_trends.py --test
+```
+
+This sends **exactly one request** (`weather`, most recent 12 months) and
+tells you immediately whether the environment can reach Google Trends at
+all, without risking a real batch. Check `logs/fetch_<timestamp>.log` for
+the result.
+
+Once the test passes, run the default (cheap) pass — most recent 12 months
+for every keyword batch, ~10 requests total, paced ~25s apart:
+
+```bash
+python fetch_trends.py
+```
+
+Many mental-health search phrases will legitimately have **zero volume**
+when restricted to `geo=IL` — that's an expected result, not a failure.
+Every run writes:
+
+- `logs/fetch_<timestamp>.log` — a full run log (every request, retry, and
+  outcome)
+- `logs/fetch_<timestamp>_report.txt` — a per-keyword summary table (max
+  value seen, and whether it had any IL search volume at all)
+
+Read the report before spending a full historical pull on a keyword that
+turned out to have no signal. Once you know which keywords are worth it,
+pull their full ~20-year history (comes back at ~yearly resolution for a
+window this wide):
+
+```bash
+python fetch_trends.py --full-history
+```
+
+Results are written to `data/trends.db` immediately after each batch (not
+buffered to the end), and re-running is safe — rows are upserted, so a
+partial or interrupted run never duplicates data and can just be re-run to
+pick up where it left off.
+
+### Next steps (not built yet)
+
+```bash
 python scripts/build_index.py       # compute indicator + composite scores
 streamlit run app/dashboard.py      # explore
 ```
