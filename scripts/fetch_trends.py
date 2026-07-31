@@ -116,17 +116,44 @@ def _is_no_data_error(exc: Exception) -> bool:
     )
 
 
+def _is_replay_rate_limited(exc: Exception) -> bool:
+    """
+    After the chart renders, trendspyg replays the widget request to get
+    the actual numbers - and only retries THAT step 3 times at a fixed 2s
+    interval, internally, not honoring the max_retries/retry_wait we pass
+    (those only govern the earlier chart-load wait). Wide date ranges seem
+    more prone to this specific failure (confirmed: 3/3 full-history
+    requests failed this way in one run). Our own outer retry with real
+    backoff covers what trendspyg's fixed 3x2s doesn't.
+    """
+    return isinstance(exc, trendspyg.DownloadError) and "rate-limited on replay" in str(exc)
+
+
+OUTER_REPLAY_RETRIES = 3
+OUTER_REPLAY_BACKOFF_SECONDS = 40
+
+
 def fetch_keyword(term: str, timeframe: str, geo: str, log: Logger):
     """
     Fetch interest_over_time for one keyword via trendspyg. trendspyg
-    already retries internally past Google's soft-throttle (up to
-    TRENDSPYG_MAX_RETRIES chart-load attempts), so no extra outer retry
-    loop is needed here.
+    already retries internally past Google's soft-throttle on the chart
+    load (up to TRENDSPYG_MAX_RETRIES attempts); this adds an outer retry
+    specifically for the separate widget-replay rate limit, which
+    trendspyg's own 3x2s internal retry is too short for.
     """
-    return trendspyg.download_google_trends_interest_over_time(
-        term, geo=geo, timeframe=timeframe,
-        max_retries=TRENDSPYG_MAX_RETRIES, retry_wait=TRENDSPYG_RETRY_WAIT,
-    )
+    for attempt in range(1, OUTER_REPLAY_RETRIES + 1):
+        try:
+            return trendspyg.download_google_trends_interest_over_time(
+                term, geo=geo, timeframe=timeframe,
+                max_retries=TRENDSPYG_MAX_RETRIES, retry_wait=TRENDSPYG_RETRY_WAIT,
+            )
+        except Exception as exc:
+            if not _is_replay_rate_limited(exc) or attempt == OUTER_REPLAY_RETRIES:
+                raise
+            wait = OUTER_REPLAY_BACKOFF_SECONDS * attempt
+            log.write(f"  widget replay rate-limited (attempt {attempt}/{OUTER_REPLAY_RETRIES}); "
+                      f"retrying in {wait}s")
+            time.sleep(wait)
 
 
 def store_observations(conn, series, keyword_id: int, batch_id: str, mode: str):
