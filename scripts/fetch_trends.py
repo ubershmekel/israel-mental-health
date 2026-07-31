@@ -196,6 +196,10 @@ def main():
     parser.add_argument("--force", action="store_true",
                          help="Re-fetch keywords even if already stored for this mode "
                               "(default: skip keywords that already have data).")
+    parser.add_argument("--only", default=None,
+                         help="Comma-separated exact keyword terms to fetch, skipping "
+                              "everything else (e.g. for re-running just the keywords "
+                              "that showed real signal in an earlier pass).")
     args = parser.parse_args()
 
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -219,6 +223,13 @@ def main():
     conn = db.connect()
 
     batch_list = list(batches())
+    if args.only:
+        wanted = {t.strip() for t in args.only.split(",") if t.strip()}
+        batch_list = [b for b in batch_list if b["keywords"][0]["term"] in wanted]
+        missing = wanted - {b["keywords"][0]["term"] for b in batch_list}
+        if missing:
+            log.write(f"WARNING: --only terms not found in keyword catalog: {missing}")
+
     log.write(f"Fetching up to {len(batch_list)} single-keyword requests (trendspyg) "
               f"for timeframe '{timeframe}', geo={args.geo}, mode='{mode}', "
               f"paced {PAUSE_BETWEEN_REQUESTS_SECONDS}s apart"
