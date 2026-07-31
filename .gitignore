@@ -3,5 +3,6 @@ __pycache__/
 *.pyc
 data/*.db
 data/*.db-journal
+data/*.csv
 logs/
 .codex/visualizations/
